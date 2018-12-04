@@ -36,6 +36,7 @@ import ssl
 import sys
 import time
 import xml.etree.cElementTree
+import os
 
 PY3 = sys.version_info > (3,)
 
@@ -118,7 +119,7 @@ class QuipClient(object):
     BLUE = range(5)
 
     def __init__(self, access_token=None, client_id=None, client_secret=None,
-                 base_url=None, request_timeout=None):
+                 base_url=None, request_timeout=None, thread_cache_dir=None):
         """Constructs a Quip API client.
 
         If `access_token` is given, all of the API methods in the client
@@ -133,6 +134,7 @@ class QuipClient(object):
         self.client_secret = client_secret
         self.base_url = base_url if base_url else "https://platform.quip.com"
         self.request_timeout = request_timeout if request_timeout else 10
+        self.thread_cache_dir = thread_cache_dir
 
     def get_authorization_url(self, redirect_uri, state=None):
         """Returns the URL the user should be redirected to to sign in."""
@@ -244,7 +246,30 @@ class QuipClient(object):
 
     def get_thread(self, id):
         """Returns the thread with the given ID."""
-        return self._fetch_json("threads/" + id)
+        if self.thread_cache_dir is not None and self.thread_is_cached(id):
+            return self.get_thread_from_cache(id)
+        else:
+            thread = self._fetch_json("threads/" + id)
+            if self.thread_cache_dir is not None:
+                self.cache_thread(id, thread)
+            return thread 
+
+    def thread_is_cached(self, id):
+        return os.path.isfile(self.cached_thread_path(id))
+
+    def cached_thread_path(self, id):
+        return os.path.join(self.thread_cache_dir, "{id}.json".format(id=id))
+
+    def get_thread_from_cache(self, id):
+        with open(self.cached_thread_path(id), mode="r") as file:
+            text = file.read()
+            thread = json.loads(text)
+            return thread
+
+    def cache_thread(self, id, thread):
+        text = json.dumps(thread, indent=2, sort_keys=True)
+        with open(self.cached_thread_path(id), mode="w") as file:
+            file.write(text)
 
     def get_threads(self, ids):
         """Returns a dictionary of threads for the given IDs."""

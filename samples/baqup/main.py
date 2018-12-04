@@ -57,12 +57,19 @@ def main():
              "https://platform.quip.com will be used")
     parser.add_argument("--output_directory", default="./",
         help="Directory where to place backup data.")
+    parser.add_argument("--cache_directory", default=None,
+        help="Directory where to cache downloaded thread data")
 
     args = parser.parse_args()
 
+    thread_cache_dir = args.cache_directory
+    if thread_cache_dir is not None:
+        thread_cache_dir = _normalize_path(thread_cache_dir)
+        _ensure_path_exists(thread_cache_dir)
+
     client = quip.QuipClient(
         access_token=args.access_token, base_url=args.quip_api_base_url,
-        request_timeout=120)
+        request_timeout=120, thread_cache_dir=thread_cache_dir)
     output_directory = os.path.join(
         _normalize_path(args.output_directory), "baqup")
     _ensure_path_exists(output_directory)
