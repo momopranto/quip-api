@@ -101,6 +101,32 @@ class QuipError(Exception):
         self.http_error = http_error
 
 
+class HeadersDict(dict):
+    def __getitem__(self, key):
+        return super(HeadersDict, self).__getitem__(key.lower())
+
+    def get(self, key, *args, **kwds):
+        return super(HeadersDict, self).get(key.lower(), *args, **kwds)
+
+class Blob(object):
+    def __init__(self, contents, headers, url, code):
+        self.contents = contents
+        self.headers = HeadersDict(headers)
+        self.url = url
+        self.code = code
+
+    def read(self):
+        return self.contents
+
+    def geturl(self):
+        return self.url
+
+    def info(self):
+        return self.headers
+    
+    def getcode(self):
+        return self.code
+
 class QuipClient(object):
     """A Quip API client"""
     # Edit operations
@@ -738,15 +764,29 @@ class QuipClient(object):
         """Returns a file-like object with the contents of the given blob from
         the given thread.
 
-        The object is described in detail here:
-        https://docs.python.org/2/library/urllib2.html#urllib2.urlopen
+        Returns a Blob object.
         """
+
+        # Load from file cache if configured and present
+        if (    self.thread_cache_dir is not None
+                and self.blob_is_cached(thread_id, blob_id)):
+            return self.get_blob_from_cache(thread_id, blob_id)
+
         request = Request(
             url=self._url("blob/%s/%s" % (thread_id, blob_id)))
         if self.access_token:
             request.add_header("Authorization", "Bearer " + self.access_token)
         try:
-            return urlopen(request, timeout=self.request_timeout)
+            response = urlopen(request, timeout=self.request_timeout)
+            blob = Blob(
+                contents = response.read(),
+                headers = response.info().dict,
+                url = response.geturl(),
+                code = response.getcode(),
+            )
+            if self.thread_cache_dir is not None:
+                self.cache_blob(thread_id, blob_id, blob)
+            return blob
         except HTTPError as error:
             try:
                 # Extract the developer-friendly error message from the response
@@ -754,6 +794,73 @@ class QuipClient(object):
             except Exception:
                 raise error
             raise QuipError(error.code, message, error)
+
+    def cache_blob(self, thread_id, blob_id, blob):
+        contents_path = self.cached_blob_contents_path(thread_id, blob_id)
+        metadata_path = self.cached_blob_metadata_path(thread_id, blob_id)
+
+        if not os.path.exists(os.path.dirname(contents_path)):
+            os.makedirs(os.path.dirname(contents_path))
+        
+        if not os.path.exists(os.path.dirname(metadata_path)):
+            os.makedirs(os.path.dirname(metadata_path))
+
+        with open(contents_path, mode='wb') as file:
+            file.write(blob.contents)
+
+        with open(metadata_path, mode='w') as file:
+            file.write(
+                json.dumps(
+                    {
+                        'headers': blob.headers,
+                        'url': blob.url,
+                        'code': blob.code,
+                    },
+                    indent=2,
+                    sort_keys=True
+                )
+            )
+
+    def get_blob_from_cache(self, thread_id, blob_id):
+        contents_path = self.cached_blob_contents_path(thread_id, blob_id)
+        metadata_path = self.cached_blob_metadata_path(thread_id, blob_id)
+
+        metadata = None
+        with open(metadata_path, 'r') as file:
+            metadata = json.load(file)
+
+        contents = None
+        with open(contents_path, mode='rb') as file:
+            contents = file.read()
+
+        blob = Blob(
+            contents = contents,
+            headers = metadata['headers'],
+            url = metadata['url'],
+            code = metadata['code'],
+        )
+
+        return blob
+
+    def blob_is_cached(self, thread_id, blob_id):
+        return (
+            os.path.isfile(self.cached_blob_contents_path(thread_id, blob_id))
+            and os.path.isfile(self.cached_blob_metadata_path(thread_id, blob_id))
+        )
+    
+    def cached_blob_contents_path(self, thread_id, blob_id):
+        return os.path.join(
+            self.thread_cache_dir,
+            thread_id,
+            "{blob_id}.contents.bin".format(blob_id=blob_id)
+        )
+
+    def cached_blob_metadata_path(self, thread_id, blob_id):
+        return os.path.join(
+            self.thread_cache_dir,
+            thread_id,
+            "{blob_id}.metadata.json".format(blob_id=blob_id)
+        )
 
     def put_blob(self, thread_id, blob, name=None):
         """Uploads an image or other blob to the given Quip thread. Returns an
