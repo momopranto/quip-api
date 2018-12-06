@@ -59,6 +59,8 @@ def main():
         help="Directory where to place backup data.")
     parser.add_argument("--cache_directory", default=None,
         help="Directory where to cache downloaded thread data")
+    parser.add_argument("--use_rate_limiting", action='store_true',
+        help="Watch API rate limit and wait when it runs out")
 
     args = parser.parse_args()
 
@@ -69,7 +71,8 @@ def main():
 
     client = quip.QuipClient(
         access_token=args.access_token, base_url=args.quip_api_base_url,
-        request_timeout=120, thread_cache_dir=thread_cache_dir)
+        request_timeout=120, thread_cache_dir=thread_cache_dir,
+        use_rate_limiting=bool(args.use_rate_limiting))
     output_directory = os.path.join(
         _normalize_path(args.output_directory), "baqup")
     _ensure_path_exists(output_directory)

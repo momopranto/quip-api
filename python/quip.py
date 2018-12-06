@@ -125,7 +125,7 @@ class Blob(object):
         return self.headers
     
     def getcode(self):
-        return self.code
+        return self.code 
 
 class QuipClient(object):
     """A Quip API client"""
@@ -145,7 +145,8 @@ class QuipClient(object):
     BLUE = range(5)
 
     def __init__(self, access_token=None, client_id=None, client_secret=None,
-                 base_url=None, request_timeout=None, thread_cache_dir=None):
+                 base_url=None, request_timeout=None, thread_cache_dir=None,
+                 use_rate_limiting=False):
         """Constructs a Quip API client.
 
         If `access_token` is given, all of the API methods in the client
@@ -161,6 +162,10 @@ class QuipClient(object):
         self.base_url = base_url if base_url else "https://platform.quip.com"
         self.request_timeout = request_timeout if request_timeout else 10
         self.thread_cache_dir = thread_cache_dir
+        self.use_rate_limiting = use_rate_limiting
+        if self.use_rate_limiting:
+            self.rate_limit_remaining = None
+            self.rate_limit_reset = None
 
     def get_authorization_url(self, redirect_uri, state=None):
         """Returns the URL the user should be redirected to to sign in."""
@@ -290,6 +295,7 @@ class QuipClient(object):
         with open(self.cached_thread_path(id), mode="r") as file:
             text = file.read()
             thread = json.loads(text)
+            logging.debug("CACHE HIT  - Got THREAD %s", id)
             return thread
 
     def cache_thread(self, id, thread):
@@ -776,24 +782,16 @@ class QuipClient(object):
             url=self._url("blob/%s/%s" % (thread_id, blob_id)))
         if self.access_token:
             request.add_header("Authorization", "Bearer " + self.access_token)
-        try:
-            response = urlopen(request, timeout=self.request_timeout)
-            blob = Blob(
-                contents = response.read(),
-                headers = response.info().dict,
-                url = response.geturl(),
-                code = response.getcode(),
-            )
-            if self.thread_cache_dir is not None:
-                self.cache_blob(thread_id, blob_id, blob)
-            return blob
-        except HTTPError as error:
-            try:
-                # Extract the developer-friendly error message from the response
-                message = json.loads(error.read().decode())["error_description"]
-            except Exception:
-                raise error
-            raise QuipError(error.code, message, error)
+        response = self._urlopen(request, timeout=self.request_timeout)
+        blob = Blob(
+            contents = response.read(),
+            headers = response.info().dict,
+            url = response.geturl(),
+            code = response.getcode(),
+        )
+        if self.thread_cache_dir is not None:
+            self.cache_blob(thread_id, blob_id, blob)
+        return blob
 
     def cache_blob(self, thread_id, blob_id, blob):
         contents_path = self.cached_blob_contents_path(thread_id, blob_id)
@@ -839,7 +837,10 @@ class QuipClient(object):
             url = metadata['url'],
             code = metadata['code'],
         )
-
+        
+        logging.debug("CACHE HIT  - Got BLOB %s for thread %s",
+            blob_id, thread_id)
+        
         return blob
 
     def blob_is_cached(self, thread_id, blob_id):
@@ -907,17 +908,9 @@ class QuipClient(object):
 
         if self.access_token:
             request.add_header("Authorization", "Bearer " + self.access_token)
-        try:
-            return json.loads(
-                urlopen(
-                    request, timeout=self.request_timeout).read().decode())
-        except HTTPError as error:
-            try:
-                # Extract the developer-friendly error message from the response
-                message = json.loads(error.read().decode())["error_description"]
-            except Exception:
-                raise error
-            raise QuipError(error.code, message, error)
+        return json.loads(
+            self._urlopen(
+                request, timeout=self.request_timeout).read().decode())
 
     def _clean(self, **args):
         return dict((k, str(v) if isinstance(v, int) else v.encode("utf-8"))
@@ -929,3 +922,113 @@ class QuipClient(object):
         if args:
             url += "?" + urlencode(args)
         return url
+    
+    def _urlopen(self, *args, **kwds):
+        """Wrapper around `urlopen` to facilitate rate limiting. Called by both
+        `._fetch_json()` and `.get_blob()` to make the actual requests.
+
+        When `.use_rate_limiting` is `False`, just proxies to `urlopen`.
+
+        When `.use_rate_limiting` is `True`, stores the remaining request count
+        and reset time, which are returned in each response's headers, and
+        checks those before making the next request.
+
+        If there are no more requests remaining, calculates the amount of time
+        until the reset and sleep until then.
+        
+        Also catches the `503 - Over Rate Limit` error and re-runs.
+        
+        Returns the same ill-documented object that `urlopen` returns.
+        
+        Raises:
+        
+        1.  `QuipError` - When `urlopen` raises an `HTTPError` that is
+            successfully parsed as an API error response.
+            
+        2.  `HTTPError` - When `urlopen` raises an `HTTPError` that could not
+            be successfully parsed.
+        """
+        
+        # If the rate limiting feature is not turned on then just call `urlopen`
+        # and be done with it.
+        if not self.use_rate_limiting:
+            return urlopen(*args, **kwds)
+        
+        # So, everything from here on out is using rate limiting...
+        
+        # Are we gonna maybe sleep? Only if we know how many requests we have
+        # remaining (which we must make a request first to learn) **and** that 
+        # remaining number is `1` or less.
+        # 
+        # No, I have no idea why `1` works and `0` does not. But that's how it
+        # be.
+        if  (self.rate_limit_remaining is not None and
+                self.rate_limit_remaining <= 1):
+            sleep_sec = self.rate_limit_reset - time.time()
+            
+            # Only actually sleep if the time is greater than `zero. It can end
+            # up being less than zero. 'Cause economics and physics and stuff.
+            if sleep_sec > 0:
+                if sleep_sec > 60:
+                    string = "%0.2f minutes" % (sleep_sec / 60)
+                else:
+                    string = "%0.2f seconds" % sleep_sec
+                
+                logging.info(
+                    "Sleeping for %s due to rate limiting...",
+                    string
+                )
+                time.sleep(sleep_sec)
+                logging.info("Ok, woke back up. Carrying on...")
+        
+        try:
+            response = urlopen(*args, **kwds)
+        except HTTPError as error:
+            try:
+                # Extract the developer-friendly error message from the response
+                message = json.loads(error.read().decode())["error_description"]
+            except Exception:
+                raise error
+            
+            # Is it a rate limit problem?
+            if error.getcode() != 503 or message != u'Over Rate Limit':
+                # It's not, raise 'er up
+                raise QuipError(error.code, message, error)
+            else:
+                # Yup, it's rate limit. Usually this means we exhausted the
+                # *hourly* rate limit, which doesn't even seem to show up 
+                # anywhere *until* you exhaust it, then it replaces the 
+                # per-minute one in the same headers.
+                
+                logging.warning("RATE LIMIT - EXHAUSTED (503 error)")
+                
+                # Set the limit values from the `error`, which is also a 
+                # whatever-like object like a successful response.
+                self._set_rate_limit_values(error)
+                
+                # And go back through again! Which *should* now trigger a sleep.
+                # 
+                # This is kinda dumb, on account of that 'should' just above,
+                # but it's easy...
+                return self._urlopen(*args, **kwds)
+        
+        self._set_rate_limit_values(response)
+        
+        return response
+    
+    def _set_rate_limit_values(self, response):
+        """Set the rate limit instance variables using data in response headers
+        """
+        
+        self.rate_limit_remaining = int(
+                response.info().get('X-Ratelimit-Remaining'))
+                
+        self.rate_limit_reset = int(
+                response.info().get('X-Ratelimit-Reset'))
+                
+        logging.debug(
+            "RATE LIMIT - remaining: %i, reset: %i (in %f seconds) <%s>",
+            self.rate_limit_remaining,
+            self.rate_limit_reset,
+            (self.rate_limit_reset - time.time()),
+            response.geturl())
