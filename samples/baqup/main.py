@@ -26,13 +26,10 @@ import os.path
 import re
 import shutil
 import sys
-import urllib2
+import urllib3
 import xml.etree.cElementTree
 import xml.sax.saxutils
 import json
-
-reload(sys)
-sys.setdefaultencoding('utf8')
 
 import quip
 
@@ -142,6 +139,18 @@ class BaqupClient(quip.QuipClient):
         
         return blob
     
+    def _fetch_file_with_caching(self, path, fmt, **args):
+        url = self._url(path, **args)
+        cache_key = re.sub(r'https?\:\/\/', '', url)
+
+        if self._cache_has(key=cache_key, format=fmt):
+            return self._cache_get(key=cache_key, format=fmt)
+        
+        contents = super(BaqupClient, self)._fetch_file(path, **args)
+
+        self._cache_put(key=cache_key, format=fmt, value=contents)
+        return contents
+
     def _fetch_json(self, path, post_data=None, **args):
         """When `post_data` is `None`, we assume this is a read request and
         proxy to `#_fetch_json_with_caching()`. Otherwise, call goes 
@@ -207,7 +216,8 @@ class BaqupClient(quip.QuipClient):
             key, format, filepath)
         
         mode = 'r'
-        if format == 'bin':
+        if format == 'bin'or format == 'docx' \
+            or format == 'xlsx' or format == 'pdf':
             mode = 'rb'
         
         with open(filepath, mode=mode) as fp:
@@ -238,7 +248,8 @@ class BaqupClient(quip.QuipClient):
         _ensure_path_exists(os.path.dirname(filepath))
         
         mode = 'w'
-        if format == 'bin':
+        if format == 'bin'or format == 'docx' \
+            or format == 'xlsx' or format == 'pdf':
             mode = 'wb'
         
         if format == 'json':
@@ -321,6 +332,51 @@ class BaqupClient(quip.QuipClient):
         
         self._cache_put(key=contents_key, format='bin', value=blob.contents)
 
+def _backup_thread_as_docx(thread, client, output_directory, depth):
+    thread_id = thread["thread"]["id"]
+    title = thread["thread"]["title"]
+    logging.info("%sBacking up thread %s (%s)...",
+        "  " * depth, title, thread_id)
+    sanitized_title = _sanitize_title(title)
+    if thread["thread"]["type"] == "document":
+        contents = client._fetch_file_with_caching(
+            'threads/{tid}/export/docx'.format(tid=thread_id), 'docx', args=None)
+        document_file_name = sanitized_title + ".docx"
+        document_output_path = os.path.join(
+            output_directory, document_file_name)
+        with open(document_output_path, 'wb') as document_file:
+            document_file.write(contents)
+
+def _backup_thread_as_xlsx(thread, client, output_directory, depth):
+    thread_id = thread["thread"]["id"]
+    title = thread["thread"]["title"]
+    logging.info("%sBacking up thread %s (%s)...",
+        "  " * depth, title, thread_id)
+    sanitized_title = _sanitize_title(title)
+    if thread["thread"]["type"] == "spreadsheet":
+        contents = client._fetch_file_with_caching(
+            'threads/{tid}/export/xlsx'.format(tid=thread_id), 'xlsx', args=None)
+        document_file_name = sanitized_title + ".xlsx"
+        document_output_path = os.path.join(
+            output_directory, document_file_name)
+        with open(document_output_path, 'wb') as document_file:
+            document_file.write(contents)
+
+def _backup_thread_as_pdf(thread, client, output_directory, depth):
+    thread_id = thread["thread"]["id"]
+    title = thread["thread"]["title"]
+    logging.info("%sBacking up thread %s (%s)...",
+        "  " * depth, title, thread_id)
+    sanitized_title = _sanitize_title(title)
+    if thread["thread"]["type"] == "slides":
+        contents = client._fetch_file_with_caching(
+            'threads/{tid}/export/pdf'.format(tid=thread_id), 'pdf', args=None)
+        document_file_name = sanitized_title + ".pdf"
+        document_output_path = os.path.join(
+            output_directory, document_file_name)
+        with open(document_output_path, 'wb') as document_file:
+            document_file.write(contents)
+
 def main():
     logging.getLogger().setLevel(logging.DEBUG)
 
@@ -353,9 +409,9 @@ def main():
             access_token=args.access_token, base_url=args.quip_api_base_url,
             request_timeout=120, use_rate_limiting=bool(args.use_rate_limiting))
     else:
-        client = quip.QuipClient(
+        client = BaqupClient(
             access_token=args.access_token, base_url=args.quip_api_base_url,
-            request_timeout=120, thread_cache_dir=thread_cache_dir,
+            request_timeout=120, cache_dir=cache_dir,
             use_rate_limiting=bool(args.use_rate_limiting))
     
     output_directory = os.path.join(
@@ -384,7 +440,15 @@ def _run_backup(client, output_directory, root_folder_id):
         conversations_directory = os.path.join(output_directory, "Conversations")
         _ensure_path_exists(conversations_directory)
         for thread in conversation_threads:
-            _backup_thread(thread, client, conversations_directory, 1)
+            if thread["thread"]["type"] == "document":
+                _backup_thread_as_docx(
+                    thread, client, conversations_directory, 1)
+            elif thread["thread"]["type"] == "slides":
+                _backup_thread_as_pdf(
+                    thread, client, conversations_directory, 1)
+            elif thread["thread"]["type"] == "spreadsheet":
+                _backup_thread_as_xlsx(
+                    thread, client, conversations_directory, 1)
 
 def _descend_into_folder(folder_id, processed_folder_ids, client,
         output_directory, depth):
@@ -401,7 +465,7 @@ def _descend_into_folder(folder_id, processed_folder_ids, client,
             logging.warning("%sSkipped over folder %s due to unknown error %d.",
                 "  " * depth, folder_id, e.code)
         return
-    except urllib2.HTTPError as e:
+    except urllib3.HTTPError as e:
         logging.warning("%sSkipped over folder %s due to HTTP error %d.",
             "  " * depth, folder_id, e.code)
         return
@@ -415,7 +479,15 @@ def _descend_into_folder(folder_id, processed_folder_ids, client,
                 client, folder_output_path, depth + 1)
         elif "thread_id" in child:
             thread = client.get_thread(child["thread_id"])
-            _backup_thread(thread, client, folder_output_path, depth + 1)
+            if thread["thread"]["type"] == "document":
+                _backup_thread_as_docx(
+                    thread, client, folder_output_path, depth + 1)
+            elif thread["thread"]["type"] == "slides":
+                _backup_thread_as_pdf(
+                    thread, client, folder_output_path, depth + 1)
+            elif thread["thread"]["type"] == "spreadsheet":
+                _backup_thread_as_xlsx(
+                    thread, client, folder_output_path, depth + 1)
 
 def _backup_thread(thread, client, output_directory, depth):
     thread_id = thread["thread"]["id"]
@@ -505,7 +577,14 @@ def _get_conversation_threads(client):
     while True:
         chunk = client.get_recent_threads(
             max_updated_usec=max_updated_usec, count=50).values()
-        chunk.sort(key=lambda t:t["thread"]["updated_usec"], reverse=True)
+        try:
+            chunk.sort(key=lambda t:t["thread"]["updated_usec"], reverse=True)
+        except Exception as e:
+            #logging.error(e)
+            chunk = sorted(chunk, key=lambda t:t["thread"]["updated_usec"], reverse=True)
+            #logging.debug(type(chunk))
+            #logging.debug(vars(chunk))
+            #logging.debug(chunk)
         threads.extend([t for t in chunk
             if "html" not in t and t["thread"]["id"] not in thread_ids])
         thread_ids.update([t["thread"]["id"] for t in chunk])

@@ -774,6 +774,14 @@ class QuipClient(object):
             self._urlopen(
                 request, timeout=self.request_timeout).read().decode())
 
+    def _fetch_file(self, path, **args):
+        request = Request(url=self._url(path, **args))
+        if self.access_token:
+            request.add_header("Authorization", "Bearer " + self.access_token)
+        response = self._urlopen(request, timeout=self.request_timeout)
+        return response.read()
+
+
     def _clean(self, **args):
         return dict((k, str(v) if isinstance(v, int) else v.encode("utf-8"))
                     for k, v in args.items() if v or isinstance(v, int))
